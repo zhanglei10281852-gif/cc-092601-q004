@@ -266,7 +266,7 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     finished_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(requested_by, idempotency_key)
+    UNIQUE(project_code, requested_by, template_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at);
 CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at);
@@ -385,6 +385,74 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+    _migrate_compute_tasks_idempotency_scope(get_connection())
+
+
+def _compute_tasks_statements() -> tuple[str, list[str]]:
+    """从 SCHEMA 中提取 compute_tasks 的建表与索引语句，保证迁移目标与全新建库一致。"""
+    create = ""
+    indexes: list[str] = []
+    for statement in SCHEMA.split(";"):
+        if "CREATE TABLE IF NOT EXISTS compute_tasks (" in statement:
+            create = statement.strip()
+        elif "ON compute_tasks(" in statement:
+            indexes.append(statement.strip())
+    if not create:
+        raise RuntimeError("SCHEMA 中缺少 compute_tasks 建表语句")
+    return create, indexes
+
+
+def _compute_tasks_scope_state(connection: sqlite3.Connection) -> str:
+    """返回 compute_tasks 幂等约束的状态：missing / legacy（仅用户+键）/ scoped（项目+用户+模板+键）。"""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='compute_tasks'").fetchone() is None:
+        return "missing"
+    legacy = False
+    for index in connection.execute("PRAGMA index_list('compute_tasks')").fetchall():
+        if not index["unique"]:
+            continue
+        columns = [info["name"] for info in connection.execute(f"PRAGMA index_info('{index['name']}')").fetchall()]
+        if columns == ["project_code", "requested_by", "template_id", "idempotency_key"]:
+            return "scoped"
+        if columns == ["requested_by", "idempotency_key"]:
+            legacy = True
+    return "legacy" if legacy else "scoped"
+
+
+def _migrate_compute_tasks_idempotency_scope(connection: sqlite3.Connection) -> None:
+    """把历史库中 compute_tasks 的 UNIQUE(requested_by, idempotency_key) 重建为
+    UNIQUE(project_code, requested_by, template_id, idempotency_key)。
+
+    新约束是旧约束的超集，历史行必然满足，因此重建拷贝是安全的；结果与干预记录
+    通过外键关联任务 id，重建保留全部 id，并在提交前做 foreign_key_check。
+    """
+    if _compute_tasks_scope_state(connection) != "legacy":
+        return
+    create_sql, index_sql = _compute_tasks_statements()
+    sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='compute_tasks'").fetchone()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(create_sql.replace("CREATE TABLE IF NOT EXISTS compute_tasks", "CREATE TABLE compute_tasks_migrated", 1))
+        columns = [row["name"] for row in connection.execute("PRAGMA table_info('compute_tasks')").fetchall()]
+        column_list = ",".join(columns)
+        connection.execute(f"INSERT INTO compute_tasks_migrated({column_list}) SELECT {column_list} FROM compute_tasks")
+        connection.execute("DROP TABLE compute_tasks")
+        connection.execute("ALTER TABLE compute_tasks_migrated RENAME TO compute_tasks")
+        for statement in index_sql:
+            connection.execute(statement)
+        max_id = int(connection.execute("SELECT COALESCE(MAX(id),0) FROM compute_tasks").fetchone()[0])
+        preserved = max(int(sequence["seq"]) if sequence else 0, max_id)
+        connection.execute("DELETE FROM sqlite_sequence WHERE name='compute_tasks'")
+        connection.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('compute_tasks',?)", (preserved,))
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"compute_tasks 幂等作用域迁移后外键校验失败: {violations}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 def migrate_db() -> None:

@@ -48,8 +48,11 @@ class ComputeRepository:
     def task_by_id(self, task_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT t.*,tpl.code AS template_code,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.id=?", (task_id,)).fetchone()
 
-    def task_by_idempotency(self, requested_by: str, key: str) -> sqlite3.Row | None:
-        return self.connection.execute("SELECT * FROM compute_tasks WHERE requested_by=? AND idempotency_key=?", (requested_by, key)).fetchone()
+    def task_by_idempotency(self, project_code: str, requested_by: str, template_id: int, key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM compute_tasks WHERE project_code=? AND requested_by=? AND template_id=? AND idempotency_key=?",
+            (project_code, requested_by, template_id, key),
+        ).fetchone()
 
     def create_task(self, *, template_id: int, project_code: str, requested_by: str, parameters: dict[str, Any], parameter_digest: str, priority: int, idempotency_key: str, max_attempts: int, now: str) -> dict[str, Any]:
         cursor = self.connection.execute(

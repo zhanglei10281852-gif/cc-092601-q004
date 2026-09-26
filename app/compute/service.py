@@ -56,11 +56,12 @@ class ComputeOperationsService:
             if template is None or not template["active"]:
                 raise NotFoundError("参数模板不存在或已经停用")
             parameters = self._validate_parameters(template, payload["parameters"])
-            existing = repository.task_by_idempotency(payload["requested_by"], payload["idempotency_key"])
+            existing = repository.task_by_idempotency(
+                payload["project_code"], payload["requested_by"], template["id"], payload["idempotency_key"]
+            )
             parameter_digest = digest(parameters)
             if existing is not None:
-                if existing["parameter_digest"] != parameter_digest:
-                    raise ConflictError("同一幂等键对应了不同的计算参数")
+                self._assert_replay_compatible(existing, parameters, parameter_digest, payload, template)
                 return dict(repository.task_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
             return repository.create_task(
@@ -234,6 +235,29 @@ class ComputeOperationsService:
             raise ConflictError("当前任务状态不允许取消")
         status = "cancel_requested" if task["status"] == "running" else "cancelled"
         connection.execute("UPDATE compute_tasks SET status=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?", (status, None if status == "cancel_requested" else now, now, task["id"]))
+
+    @staticmethod
+    def _assert_replay_compatible(existing: sqlite3.Row, parameters: dict[str, Any], parameter_digest: str, payload: dict[str, Any], template: sqlite3.Row) -> None:
+        """同一作用域（项目+提交人+模板+请求键）内的重复提交必须与首次提交完全一致。"""
+        scope = {
+            "project_code": payload["project_code"],
+            "requested_by": payload["requested_by"],
+            "template_code": template["code"],
+            "idempotency_key": payload["idempotency_key"],
+            "existing_task_id": existing["id"],
+        }
+        if existing["parameter_digest"] != parameter_digest:
+            stored = json.loads(existing["parameters_json"])
+            differing = sorted(name for name in set(stored) | set(parameters) if stored.get(name) != parameters.get(name))
+            raise ConflictError(
+                "同一提交作用域内的计算参数与首次提交不一致",
+                context={**scope, "differing_parameters": differing},
+            )
+        if int(existing["priority"]) != int(payload["priority"]):
+            raise ConflictError(
+                "同一提交作用域内的优先级与首次提交不一致",
+                context={**scope, "existing_priority": int(existing["priority"]), "provided_priority": int(payload["priority"])},
+            )
 
     def _check_quota(self, repository: ComputeRepository, requested_by: str, now: datetime) -> None:
         quota = repository.quota("user", requested_by)
