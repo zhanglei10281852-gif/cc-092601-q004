@@ -48,13 +48,16 @@ class ComputeRepository:
     def task_by_id(self, task_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT t.*,tpl.code AS template_code,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.id=?", (task_id,)).fetchone()
 
-    def task_by_idempotency(self, requested_by: str, key: str) -> sqlite3.Row | None:
-        return self.connection.execute("SELECT * FROM compute_tasks WHERE requested_by=? AND idempotency_key=?", (requested_by, key)).fetchone()
+    def task_by_idempotency(self, project_code: str, requested_by: str, template_id: int, key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM compute_tasks WHERE project_code=? AND requested_by=? AND template_id=? AND idempotency_key=?",
+            (project_code, requested_by, template_id, key),
+        ).fetchone()
 
     def create_task(self, *, template_id: int, project_code: str, requested_by: str, parameters: dict[str, Any], parameter_digest: str, priority: int, idempotency_key: str, max_attempts: int, now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO compute_tasks(template_id,project_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,status,attempt_count,max_attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'queued',0,?,?,?,?)",
-            (template_id, project_code, requested_by, json.dumps(parameters, ensure_ascii=False, sort_keys=True), parameter_digest, priority, idempotency_key, max_attempts, now, now, now),
+            "INSERT INTO compute_tasks(template_id,project_code,requested_by,parameters_json,parameter_digest,priority,submitted_priority,idempotency_key,status,attempt_count,max_attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'queued',0,?,?,?,?)",
+            (template_id, project_code, requested_by, json.dumps(parameters, ensure_ascii=False, sort_keys=True), parameter_digest, priority, priority, idempotency_key, max_attempts, now, now, now),
         )
         return dict(self.task_by_id(cursor.lastrowid))
 

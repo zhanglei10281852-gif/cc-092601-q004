@@ -56,18 +56,56 @@ class ComputeOperationsService:
             if template is None or not template["active"]:
                 raise NotFoundError("参数模板不存在或已经停用")
             parameters = self._validate_parameters(template, payload["parameters"])
-            existing = repository.task_by_idempotency(payload["requested_by"], payload["idempotency_key"])
             parameter_digest = digest(parameters)
+            scope = {
+                "project_code": payload["project_code"],
+                "requested_by": payload["requested_by"],
+                "template_code": payload["template_code"],
+                "idempotency_key": payload["idempotency_key"],
+            }
+            existing = repository.task_by_idempotency(
+                payload["project_code"], payload["requested_by"], template["id"], payload["idempotency_key"]
+            )
             if existing is not None:
-                if existing["parameter_digest"] != parameter_digest:
-                    raise ConflictError("同一幂等键对应了不同的计算参数")
+                self._ensure_same_request(existing, parameter_digest, payload["priority"], scope)
                 return dict(repository.task_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
-            return repository.create_task(
-                template_id=template["id"], project_code=payload["project_code"],
-                requested_by=payload["requested_by"], parameters=parameters,
-                parameter_digest=parameter_digest, priority=payload["priority"],
-                idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"], now=now,
+            try:
+                return repository.create_task(
+                    template_id=template["id"], project_code=payload["project_code"],
+                    requested_by=payload["requested_by"], parameters=parameters,
+                    parameter_digest=parameter_digest, priority=payload["priority"],
+                    idempotency_key=payload["idempotency_key"], max_attempts=template["max_attempts"], now=now,
+                )
+            except sqlite3.IntegrityError:
+                # 并发下同一作用域的请求可能刚好在配额检查后落库：复用该记录而不是再扣一次配额。
+                existing = repository.task_by_idempotency(
+                    payload["project_code"], payload["requested_by"], template["id"], payload["idempotency_key"]
+                )
+                if existing is None:
+                    raise
+                self._ensure_same_request(existing, parameter_digest, payload["priority"], scope)
+                return dict(repository.task_by_id(existing["id"]))
+
+    @staticmethod
+    def _ensure_same_request(existing: sqlite3.Row, parameter_digest: str, priority: int, scope: dict[str, str]) -> None:
+        """同一幂等作用域内参数或优先级不一致时给出可解释的冲突，而不是静默串用任务。"""
+        mismatches: list[str] = []
+        context = dict(scope)
+        if existing["parameter_digest"] != parameter_digest:
+            mismatches.append("计算参数")
+            context["stored_parameter_digest"] = existing["parameter_digest"]
+            context["request_parameter_digest"] = parameter_digest
+        stored_priority = int(existing["submitted_priority"])
+        if stored_priority != int(priority):
+            mismatches.append("优先级")
+            context["stored_priority"] = stored_priority
+            context["request_priority"] = int(priority)
+        if mismatches:
+            context["existing_task_id"] = existing["id"]
+            raise ConflictError(
+                "同一幂等作用域（项目、提交人、模板、请求键）已提交过不同" + "、".join(mismatches) + "的请求",
+                context=context,
             )
 
     def list_tasks(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:

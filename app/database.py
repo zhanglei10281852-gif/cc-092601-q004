@@ -12,7 +12,46 @@ from app.core.clock import to_storage, utc_now
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "township.db"
 _local = threading.local()
 
-SCHEMA = r''' 
+# 幂等作用域：项目 + 提交人 + 模板 + 科研门户请求键共同确定一次提交。
+# submitted_priority 固化提交时的优先级，避免事后人工调级污染重复请求判定。
+COMPUTE_TASKS_COLUMNS_SQL = """
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
+    project_code TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    parameter_digest TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+    submitted_priority INTEGER NOT NULL DEFAULT 50 CHECK(submitted_priority BETWEEN 0 AND 100),
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    current_result_version INTEGER,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CONSTRAINT uq_compute_tasks_submission UNIQUE(project_code, requested_by, template_id, idempotency_key)
+"""
+
+COMPUTE_TASKS_INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at);
+CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at);
+CREATE INDEX IF NOT EXISTS idx_compute_tasks_submission_key ON compute_tasks(requested_by,idempotency_key);
+"""
+
+COMPUTE_TASKS_DDL = (
+    "CREATE TABLE IF NOT EXISTS compute_tasks (\n" + COMPUTE_TASKS_COLUMNS_SQL + ");\n"
+) + COMPUTE_TASKS_INDEXES_SQL
+
+SCHEMA = r'''
 CREATE TABLE IF NOT EXISTS departments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -243,33 +282,7 @@ CREATE TABLE IF NOT EXISTS compute_quotas (
     updated_at TEXT NOT NULL,
     UNIQUE(subject_type, subject_key)
 );
-CREATE TABLE IF NOT EXISTS compute_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
-    project_code TEXT NOT NULL,
-    requested_by TEXT NOT NULL,
-    parameters_json TEXT NOT NULL,
-    parameter_digest TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
-    idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
-    available_at TEXT NOT NULL,
-    lease_owner TEXT NOT NULL DEFAULT '',
-    lease_expires_at TEXT NOT NULL DEFAULT '',
-    current_result_version INTEGER,
-    last_error_code TEXT NOT NULL DEFAULT '',
-    last_error_message TEXT NOT NULL DEFAULT '',
-    version INTEGER NOT NULL DEFAULT 1,
-    started_at TEXT,
-    finished_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(requested_by, idempotency_key)
-);
-CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at);
-CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at);
+''' + COMPUTE_TASKS_DDL + r'''
 CREATE TABLE IF NOT EXISTS compute_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
@@ -359,7 +372,64 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_compute_tasks_scope(connection: sqlite3.Connection) -> None:
+    """把 compute_tasks 的幂等作用域迁移到 (项目, 提交人, 模板, 请求键)。
+
+    旧库的唯一约束是 (requested_by, idempotency_key)，SQLite 不支持就地修改约束，
+    因此按官方表重建流程处理。重建期间临时关闭外键：外键开启时 DROP TABLE 会对
+    compute_results/compute_interventions 触发隐式级联删除；外键开关不能在事务内
+    切换，所以整个重建在独立连接状态下完成。
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='compute_tasks'"
+    ).fetchone()
+    if row is None:
+        return  # 全新数据库，SCHEMA 已创建目标结构
+    columns = {item["name"] for item in connection.execute("PRAGMA table_info(compute_tasks)").fetchall()}
+    if "uq_compute_tasks_submission" in (row[0] or "") and "submitted_priority" in columns:
+        return
+    # 旧约束下同一 (requested_by,idempotency_key) 至多一行，新四列作用域在历史数据上
+    # 不可能产生冲突，直接复制即可完整保留任务、结果与干预记录的归属。
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "CREATE TABLE compute_tasks_new (\n" + COMPUTE_TASKS_COLUMNS_SQL + ")"
+            )
+            priority_source = "submitted_priority" if "submitted_priority" in columns else "priority"
+            connection.execute(
+                f"""INSERT INTO compute_tasks_new(
+                    id,template_id,project_code,requested_by,parameters_json,parameter_digest,
+                    priority,submitted_priority,idempotency_key,status,attempt_count,max_attempts,
+                    available_at,lease_owner,lease_expires_at,current_result_version,
+                    last_error_code,last_error_message,version,started_at,finished_at,created_at,updated_at
+                ) SELECT
+                    id,template_id,project_code,requested_by,parameters_json,parameter_digest,
+                    priority,{priority_source},idempotency_key,status,attempt_count,max_attempts,
+                    available_at,lease_owner,lease_expires_at,current_result_version,
+                    last_error_code,last_error_message,version,started_at,finished_at,created_at,updated_at
+                FROM compute_tasks"""
+            )
+            connection.execute("DROP TABLE compute_tasks")
+            connection.execute("ALTER TABLE compute_tasks_new RENAME TO compute_tasks")
+            for statement in COMPUTE_TASKS_INDEXES_SQL.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"幂等作用域迁移后存在外键违例：{violations!r}")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
+    _ensure_compute_tasks_scope(get_connection())
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
